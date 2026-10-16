@@ -92,8 +92,8 @@ class TestDPCLNSimulationLogic(unittest.TestCase):
         g_pass = self.gate.evaluate(t=100, stim_history=stim_history, contraindication=False, confidence=0.60)
         self.assertEqual(g_pass, 1, "Gate must pass when confidence >= 0.60")
 
-    def test_refractory_enforcement(self):
-        """No stimulation permitted if elapsed time since last stimulation < refractory_h."""
+    def test_canonical_refractory_enforcement_24h(self):
+        """Verifies canonical benchmark refractory enforcement (tau_ref = 24 h): no stimulation permitted if elapsed time < 24 h."""
         stim_history = [100]
         # At t = 101 to 123 (less than 24 h elapsed)
         for t in range(101, 124):
@@ -221,19 +221,22 @@ class TestDPCLNSimulationLogic(unittest.TestCase):
     # -------------------------------------------------------------------------
     # 5. Burden-Matching & Fair Comparator Tests
     # -------------------------------------------------------------------------
-    def test_burden_matching_exact_count_and_safety_constraints(self):
-        """Verifies build_burden_matched_days achieves exact target counts under all safety constraints."""
-        from literature.dpcln_stress_test import sample_patient_cohort, build_burden_matched_days, run_patient_simulation, SimpleLogisticRiskModel
+    def test_burden_matching_canonical_refractory_24h_and_safety_constraints(self):
+        """Verifies build_burden_matched_days achieves exact target counts under canonical benchmark 24-hour refractory (tau_ref = 24 h) and weekly cap constraints."""
+        try:
+            from dpcln_stress_test import sample_patient_cohort, build_burden_matched_days, run_patient_simulation, SimpleLogisticRiskModel
+        except ImportError:
+            from literature.dpcln_stress_test import sample_patient_cohort, build_burden_matched_days, run_patient_simulation, SimpleLogisticRiskModel
         rng = np.random.default_rng(101)
         cohort = sample_patient_cohort(20, rng)
         model = SimpleLogisticRiskModel()
 
         for p in cohort:
             for n_target in [0, 5, 15, 30]:
-                selected = build_burden_matched_days(n_target, p, rng, ref_h=24, cap_w=5)
+                selected = build_burden_matched_days(n_target, p, rng, ref_h=None, cap_w=5)
                 self.assertEqual(len(selected), n_target, f"Failed to match target count {n_target}")
 
-                # Verify refractory constraint (minimum 1-day gap for ref_h=24)
+                # Verify refractory constraint (minimum 1-day gap for canonical ref_h=24)
                 sorted_days = sorted(selected)
                 for idx in range(len(sorted_days) - 1):
                     self.assertGreaterEqual(sorted_days[idx + 1] - sorted_days[idx], 1, "Refractory violation in selected days")
@@ -248,9 +251,12 @@ class TestDPCLNSimulationLogic(unittest.TestCase):
                 delivered = np.sum(u_mat[30:])  # Scored post burn-in
                 self.assertEqual(delivered, n_target, f"Delivered stimulations ({delivered}) != target ({n_target})")
 
-    def test_burden_matching_refractory_48h(self):
-        """Verifies burden matching enforces 48-hour refractory (>= 2-day gap) correctly."""
-        from literature.dpcln_stress_test import sample_patient_cohort, build_burden_matched_days
+    def test_burden_matching_refractory_sensitivity_sweep_48h(self):
+        """Verifies that when the refractory interval is varied to 48 hours in exploratory parameter sensitivity sweeps, burden matching enforces a minimum 2-day gap, contrasting with the canonical benchmark (tau_ref = 24 h)."""
+        try:
+            from dpcln_stress_test import sample_patient_cohort, build_burden_matched_days
+        except ImportError:
+            from literature.dpcln_stress_test import sample_patient_cohort, build_burden_matched_days
         rng = np.random.default_rng(202)
         cohort = sample_patient_cohort(10, rng)
         for p in cohort:
@@ -259,14 +265,17 @@ class TestDPCLNSimulationLogic(unittest.TestCase):
                 self.assertEqual(len(selected), n_target)
                 sorted_days = sorted(selected)
                 for idx in range(len(sorted_days) - 1):
-                    self.assertGreaterEqual(sorted_days[idx + 1] - sorted_days[idx], 2, "48-h refractory violation: gap < 2 days")
+                    self.assertGreaterEqual(sorted_days[idx + 1] - sorted_days[idx], 2, "48-h refractory sweep violation: gap < 2 days")
 
     # -------------------------------------------------------------------------
     # 6. Pipeline Lag & Latent State Leakage Tests
     # -------------------------------------------------------------------------
     def test_pipeline_lag_no_leakage(self):
         """Verifies that features for day k depend strictly on history through day k-1 and cannot see day k data."""
-        from literature.dpcln_stress_test import SimpleLogisticRiskModel
+        try:
+            from dpcln_stress_test import SimpleLogisticRiskModel
+        except ImportError:
+            from literature.dpcln_stress_test import SimpleLogisticRiskModel
         model = SimpleLogisticRiskModel()
         rng = np.random.default_rng(303)
 
@@ -294,7 +303,10 @@ class TestDPCLNSimulationLogic(unittest.TestCase):
 
     def test_uninformative_scenario_dissociation(self):
         """Verifies uninformative scenario defaults to m_b=0 and has zero coupling to disease state."""
-        from literature.dpcln_stress_test import sample_patient_cohort, generate_patient_observations
+        try:
+            from dpcln_stress_test import sample_patient_cohort, generate_patient_observations
+        except ImportError:
+            from literature.dpcln_stress_test import sample_patient_cohort, generate_patient_observations
         rng = np.random.default_rng(404)
         cohort = sample_patient_cohort(10, rng, scenario="uninformative")
 
@@ -318,7 +330,10 @@ class TestDPCLNSimulationLogic(unittest.TestCase):
 
     def test_misleading_distribution_shift(self):
         """Verifies train-test distribution shift for misleading scenario (rho_train=0.6, rho_test=0.0)."""
-        from literature.dpcln_stress_test import sample_patient_cohort
+        try:
+            from dpcln_stress_test import sample_patient_cohort
+        except ImportError:
+            from literature.dpcln_stress_test import sample_patient_cohort
         rng = np.random.default_rng(505)
         train_cohort = sample_patient_cohort(5, rng, scenario="misleading", is_test=False)
         test_cohort = sample_patient_cohort(5, rng, scenario="misleading", is_test=True)
@@ -540,7 +555,10 @@ class TestMarkovMatrixAndDynamicsAudit(unittest.TestCase):
         4. Day k -> k+1: Latent state transition uses day k's treatment.
         Confirms z[k+1] does not leak into day k's stimulation decisions.
         """
-        from literature.dpcln_stress_test import sample_patient_cohort, run_patient_simulation, SimpleLogisticRiskModel
+        try:
+            from dpcln_stress_test import sample_patient_cohort, run_patient_simulation, SimpleLogisticRiskModel
+        except ImportError:
+            from literature.dpcln_stress_test import sample_patient_cohort, run_patient_simulation, SimpleLogisticRiskModel
         rng = np.random.default_rng(123)
         cohort = sample_patient_cohort(2, rng, scenario="informative")
         risk_model = SimpleLogisticRiskModel()

@@ -300,7 +300,8 @@ def simulate_natural_history(p):
 
 
 def run_patient_simulation(p, arm, risk_model, theta_b=1.2, theta_r=0.4, kappa=3.0,
-                           target_stim_days=None, theta_min=None, theta_max=None):
+                           target_stim_days=None, theta_min=None, theta_max=None,
+                           ref_h=None, cap_w=None):
     """
     Simulates a single virtual patient under a specified controller arm.
     Returns:
@@ -309,8 +310,10 @@ def run_patient_simulation(p, arm, risk_model, theta_b=1.2, theta_r=0.4, kappa=3
       stims_per_day: daily stimulation counts
     """
     n_days = DEFAULT_CONFIG["n_days"]
-    ref_h = DEFAULT_CONFIG["refractory_h"]
-    cap_w = DEFAULT_CONFIG["weekly_cap"]
+    if ref_h is None:
+        ref_h = DEFAULT_CONFIG["refractory_h"]
+    if cap_w is None:
+        cap_w = DEFAULT_CONFIG["weekly_cap"]
     slot_h = DEFAULT_CONFIG["slot_hour"]
     gamma = DEFAULT_CONFIG["gamma"]
     d50 = DEFAULT_CONFIG["d50"]
