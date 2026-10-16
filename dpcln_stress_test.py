@@ -427,7 +427,7 @@ def run_patient_simulation(p, arm, risk_model, theta_b=1.2, theta_r=0.4, kappa=3
         if k < n_days - 1:
             p12_eff = p["p12"] * (1.0 - 0.8 * e_eff)
             p20_eff = min(0.90, p["p20"] * (1.0 + 2.0 * e_eff))
-            p01_eff = p["p01"] * (1.0 + harm * d_k)
+            p01_eff = min(1.0, p["p01"] * (1.0 + harm * d_k))
             u_trans = p["trans_u"][k + 1]
 
             curr = z[k]
