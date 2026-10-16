@@ -13,7 +13,7 @@ This repository provides open-science supplementary materials, reproducible lite
 | File | Description |
 | :--- | :--- |
 | `dpcln_stress_test.py` | Complete Python implementation of the in silico hierarchical stress-test benchmark specification (Section 6 of the manuscript), featuring multi-state Markov disease dynamics, circadian variation, baseline signal drift, severity-dependent informative missingness, treatment carryover, tolerance decay, and exact burden-matched random comparators. |
-| `test_dpcln_simulation_logic.py` | Deterministic unit test suite (17 tests) verifying control policies, clinician safety veto $g(t)$, refractory enforcement ($\tau_{\text{ref}} = 24$ h), 7-day budget caps ($N_{\text{cap}} = 5$), treatment kinetics, and bounded threshold modulation $\theta_b(\hat{r})$. |
+| `test_dpcln_simulation_logic.py` | Comprehensive deterministic unit test suite (24 tests across 2 test classes) verifying control policies, clinician safety veto $g(t)$, refractory enforcement ($\tau_{\text{ref}} = 24$ h), 7-day budget caps ($N_{\text{cap}} = 5$), treatment kinetics, bounded threshold modulation $\theta_b(\hat{r})$, complete $3 \times 3$ Markov stochastic validity, and geometric duration bounds. |
 | `protocol_v2_search_strategy.md` | Complete PRISMA-S aligned documentation of the four-stream PubMed/MEDLINE search architecture (Protocol v2) executed via NCBI Entrez E-utilities, detailing full Boolean query strings, retrieval dates, and deduplication criteria. |
 | `screening_audit_trail.md` | Screening and adjudication logs across the 8,137 unique deduplicated corpus, detailing Stage 1 rule-based automated triage (990 exclusions) and Stage 2 manual adjudication of 73 edge cases (+5 net adjustment $\to$ 7,152 retained candidates). |
 | `reference_claim_verification_table.csv` | Evidence extraction table capturing study design, patient sample size, sensing modalities, neuromodulation parameters, validation strategies, and quantitative findings across core benchmark studies. |
@@ -30,7 +30,7 @@ This repository provides open-science supplementary materials, reproducible lite
 
 ## Installation & Running the Unit Tests
 
-The test suite validates all control-theoretic gates and mathematical kinetics deterministically without requiring external data:
+The test suite validates all control-theoretic gates, mathematical kinetics, and stochastic matrix properties deterministically without requiring external data:
 
 ### Prerequisites
 - Python 3.9+
@@ -46,16 +46,13 @@ cd dp-cln-benchmark
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the 17 deterministic unit tests
-python -m unittest test_dpcln_simulation_logic.py
+# Run all 24 deterministic unit tests
+python -m unittest -v test_dpcln_simulation_logic.py
 ```
 
-All 17 tests verify:
-- Clinician safety veto enforcement (contraindications, confidence thresholds).
-- Rolling refractory intervals ($\tau_{\text{ref}}$) and 7-day weekly dose budgets ($N_{\text{cap}}$).
-- Pharmacodynamic saturation ($w_k$) and chronic tolerance desensitization ($\text{tol}_k$).
-- Bounded risk-adaptive threshold clipping: $\theta_b(\hat{r}) = \operatorname{clip}\big(\theta_0 - \kappa(\hat{r} - \bar{r}),\, \theta_{\min},\, \theta_{\max}\big)$.
-- Absence of state leakage during uninformative and missingness scenarios.
+The 24 tests verify:
+- **Control & Safety Governance (17 tests):** Clinician safety veto enforcement (contraindications, confidence thresholds), rolling refractory intervals ($\tau_{\text{ref}} = 24$ h), 7-day weekly dose budgets ($N_{\text{cap}} = 5$), pharmacodynamic saturation ($w_k$), chronic tolerance desensitization ($\text{tol}_k$), bounded risk-adaptive threshold clipping $\theta_b(\hat{r})$, and absence of state leakage.
+- **Mathematical Matrix & Kinetic Audits (7 tests):** Exhaustive stochastic validity across 100,000 parameter sweeps (row sums identically 1.0 $\pm 10^{-14}$), 6 deterministic extreme corner cases, dimensional consistency of $h D_k$, non-saturation of over-stimulation risk ($p_{01}' \le 0.051 \ll 1.0$), analytical episode holding times ($p_{20}' \in [0.03, 0.24]$, duration $4.2$--$11.1$ days under maximal efficacy), and dual-clock causal update order.
 
 ---
 

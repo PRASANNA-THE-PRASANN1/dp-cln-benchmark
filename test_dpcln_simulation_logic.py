@@ -553,6 +553,88 @@ class TestMarkovMatrixAndDynamicsAudit(unittest.TestCase):
         self.assertTrue(np.all(np.isin(z, [0, 1, 2])))
         self.assertTrue(np.all(np.isin(u_mat, [0, 1])))
 
+    def test_markov_matrix_deterministic_edge_cases(self):
+        """
+        Tests 6 deterministic extreme boundary corner cases:
+        1. Minimal baseline parameters, zero dose, zero efficacy.
+        2. Maximal baseline parameters, zero dose, zero efficacy.
+        3. Maximal efficacy (e_eff = 1.0) with zero dose.
+        4. Maximal efficacy (e_eff = 1.0) with maximal steady-state dose (D_k = 14.28 sessions).
+        5. Extreme out-of-envelope dose (D_k = 1000.0 sessions), testing min(1.0, ...) cap on p01'.
+        6. Zero efficacy non-responder (e_eff = 0.0) with heavy dose (D_k = 20.0 sessions).
+        Verifies all entries in [0, 1] and all row sums identically 1.0.
+        """
+        h = 0.05
+        test_corners = [
+            # (p01, p12, p10, p20, e_eff, d_k, description)
+            (0.005, 0.10, 0.05, 0.03, 0.0, 0.0, "Minimal baseline, no treatment"),
+            (0.030, 0.30, 0.15, 0.08, 0.0, 0.0, "Maximal baseline, no treatment"),
+            (0.030, 0.30, 0.15, 0.08, 1.0, 0.0, "Maximal efficacy, zero dose"),
+            (0.030, 0.30, 0.15, 0.08, 1.0, 14.2857, "Maximal efficacy, max budget dose"),
+            (0.030, 0.30, 0.15, 0.08, 1.0, 1000.0, "Extreme out-of-envelope dose (clamp check)"),
+            (0.015, 0.20, 0.10, 0.05, 0.0, 20.0, "Non-responder under heavy dose")
+        ]
+
+        for p01, p12, p10, p20, e_eff, d_k, desc in test_corners:
+            p12_eff = p12 * (1.0 - 0.80 * e_eff)
+            p20_eff = min(0.90, p20 * (1.0 + 2.0 * e_eff))
+            p01_eff = min(1.0, p01 * (1.0 + h * d_k))
+
+            # Matrix P'
+            P = np.array([
+                [1.0 - p01_eff, p01_eff, 0.0],
+                [p10, 1.0 - p10 - p12_eff, p12_eff],
+                [p20_eff, 0.0, 1.0 - p20_eff]
+            ])
+
+            # Assert all elements within [0, 1]
+            self.assertTrue(np.all(P >= 0.0), f"Negative entry in {desc}: P=\n{P}")
+            self.assertTrue(np.all(P <= 1.0), f"Entry > 1.0 in {desc}: P=\n{P}")
+
+            # Assert each row sums to 1.0
+            row_sums = np.sum(P, axis=1)
+            np.testing.assert_allclose(row_sums, [1.0, 1.0, 1.0], atol=1e-15,
+                                      err_msg=f"Row sum failure in {desc}: {row_sums}")
+
+            # Specifically verify p01_eff clamp at extreme dose
+            if d_k == 1000.0:
+                self.assertEqual(p01_eff, 1.0, "Extreme dose must clamp p01' at exactly 1.0")
+                self.assertEqual(P[0, 0], 0.0)
+                self.assertEqual(P[0, 1], 1.0)
+
+    def test_treatment_modified_episode_duration_exact_bounds(self):
+        """
+        Independently verifies analytical bounds of p20' and episode duration:
+        - Baseline: p20 in [0.03, 0.08] => E[T] in [12.5, 33.33] days.
+        - Treatment formula: p20' = min(0.90, p20*(1 + 2*e_eff)) with e_eff in [0, 1].
+        - Across ALL possible treatment levels: p20' in [0.03, 0.24] => E[T'] in [4.167, 33.333] days.
+        - Under MAXIMAL efficacy (e_eff = 1.0): p20' = 3*p20 in [0.09, 0.24] => E[T'] in [4.167, 11.111] days.
+        """
+        # All possible values of p20 and e_eff
+        p20_vals = np.linspace(0.03, 0.08, 100)
+        e_eff_vals = np.linspace(0.0, 1.0, 100)
+
+        p20_grid, e_grid = np.meshgrid(p20_vals, e_eff_vals)
+        p20_prime_grid = np.minimum(0.90, p20_grid * (1.0 + 2.0 * e_grid))
+
+        # Absolute bounds across all parameter combinations
+        min_p20_prime = np.min(p20_prime_grid)
+        max_p20_prime = np.max(p20_prime_grid)
+
+        self.assertAlmostEqual(min_p20_prime, 0.03, places=5)
+        self.assertAlmostEqual(max_p20_prime, 0.24, places=5)
+
+        # Durations
+        durations = 1.0 / p20_prime_grid
+        self.assertAlmostEqual(np.min(durations), 4.1667, places=3)
+        self.assertAlmostEqual(np.max(durations), 33.3333, places=3)
+
+        # Under maximal efficacy e_eff = 1.0:
+        p20_prime_max_eff = p20_vals * 3.0
+        durations_max_eff = 1.0 / p20_prime_max_eff
+        self.assertAlmostEqual(np.min(durations_max_eff), 4.1667, places=3)  # 4.2 days
+        self.assertAlmostEqual(np.max(durations_max_eff), 11.1111, places=3) # 11.1 days
+
 
 def run_tests():
     loader = unittest.TestLoader()
