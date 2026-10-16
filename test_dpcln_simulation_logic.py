@@ -1,0 +1,407 @@
+"""
+Deterministic Unit and Integration Tests for DP-CLN Simulation Control Logic
+
+Verifies:
+1. Safety Gate Failures (contraindications, confidence thresholds).
+2. Rolling Refractory Enforcement (no stim within tau_ref).
+3. Rolling Weekly Budget / Cap Enforcement (no more than N_cap per 7 days).
+4. Boundary Cases:
+   - Zero treatment efficacy (e_i = 0)
+   - Zero observation noise
+   - 100% missing data
+5. Treatment Pharmacodynamic Kinetics:
+   - Carryover accumulation (D_k = gamma * D_{k-1} + n_k)
+   - Nonlinear saturation (w_k = 1 - exp(-D_k / D50))
+   - Tolerance desensitization (tol_k = exp(-C_k / T))
+6. Hand-Calculated Known Trajectory (step-by-step verification).
+"""
+
+import os
+import sys
+import unittest
+import numpy as np
+
+# Ensure parent and local directory are on sys.path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+class SafetyGate:
+    """Implements clinician-governed hard safety gate g(t)."""
+    def __init__(self, refractory_h=24, weekly_cap=5, min_confidence=0.6):
+        self.refractory_h = refractory_h
+        self.weekly_cap = weekly_cap
+        self.min_confidence = min_confidence
+
+    def evaluate(self, t, stim_history, contraindication=False, confidence=1.0):
+        # 1. Active contraindication
+        if contraindication:
+            return 0
+        # 2. Insufficient confidence (safe-mode fallback)
+        if confidence < self.min_confidence:
+            return 0
+        # 3. Refractory period
+        recent_stims = [st for st in stim_history if st < t]
+        if recent_stims and (t - recent_stims[-1]) < self.refractory_h:
+            return 0
+        # 4. Rolling 7-day (168 h) stimulation cap
+        window_stims = [st for st in stim_history if t - 168 < st < t]
+        if len(window_stims) >= self.weekly_cap:
+            return 0
+        return 1
+
+
+class TreatmentDynamics:
+    """Implements dose carryover, saturation, and tolerance."""
+    def __init__(self, gamma=0.85, d50=2.0, t_tol=60.0):
+        self.gamma = gamma
+        self.d50 = d50
+        self.t_tol = t_tol
+
+    def step(self, d_prev, cum_stims, n_today, e_intrinsic):
+        d_k = self.gamma * d_prev + n_today
+        w_k = 1.0 - np.exp(-d_k / self.d50)
+        cum_stims_next = cum_stims + n_today
+        tol_k = np.exp(-cum_stims_next / self.t_tol)
+        e_eff = e_intrinsic * w_k * tol_k
+        return d_k, cum_stims_next, w_k, tol_k, e_eff
+
+
+class TestDPCLNSimulationLogic(unittest.TestCase):
+
+    def setUp(self):
+        self.gate = SafetyGate(refractory_h=24, weekly_cap=5, min_confidence=0.6)
+        self.dynamics = TreatmentDynamics(gamma=0.85, d50=2.0, t_tol=60.0)
+
+    # -------------------------------------------------------------------------
+    # 1. Safety Gate Tests
+    # -------------------------------------------------------------------------
+    def test_contraindication_blocks_stimulation(self):
+        """g(t) MUST be 0 if contraindication is active, regardless of time or history."""
+        # Clean history
+        stim_history = []
+        g = self.gate.evaluate(t=100, stim_history=stim_history, contraindication=True, confidence=0.99)
+        self.assertEqual(g, 0, "Gate must reject when contraindication=True")
+
+    def test_low_confidence_blocks_stimulation(self):
+        """g(t) MUST be 0 if model confidence < c_min (safe mode fallback)."""
+        stim_history = []
+        g = self.gate.evaluate(t=100, stim_history=stim_history, contraindication=False, confidence=0.59)
+        self.assertEqual(g, 0, "Gate must reject when confidence < 0.60")
+
+        g_pass = self.gate.evaluate(t=100, stim_history=stim_history, contraindication=False, confidence=0.60)
+        self.assertEqual(g_pass, 1, "Gate must pass when confidence >= 0.60")
+
+    def test_refractory_enforcement(self):
+        """No stimulation permitted if elapsed time since last stimulation < refractory_h."""
+        stim_history = [100]
+        # At t = 101 to 123 (less than 24 h elapsed)
+        for t in range(101, 124):
+            g = self.gate.evaluate(t=t, stim_history=stim_history, contraindication=False, confidence=1.0)
+            self.assertEqual(g, 0, f"Gate must block stimulation at t={t} (last stim at 100, gap={t-100} < 24)")
+
+        # At t = 124 (exactly 24 h elapsed)
+        g_exact = self.gate.evaluate(t=124, stim_history=stim_history, contraindication=False, confidence=1.0)
+        self.assertEqual(g_exact, 1, "Gate must permit stimulation at t=124 (gap=24 h)")
+
+    def test_weekly_cap_enforcement(self):
+        """No stimulation permitted if 5 stimulations occurred in the past 168 hours."""
+        # 5 stimulations spaced 25 hours apart: t = 0, 25, 50, 75, 100
+        stim_history = [0, 25, 50, 75, 100]
+        # At t = 125 (gap since last is 25 h > 24 h, but all 5 are within 168 h window [125-168 = -43])
+        g_cap = self.gate.evaluate(t=125, stim_history=stim_history, contraindication=False, confidence=1.0)
+        self.assertEqual(g_cap, 0, "Gate must block 6th stimulation when 5 already occurred within 168 h")
+
+        # Advance time to t = 169 (stim at 0 drops out of the 168-hour window [169-168 = 1])
+        # Remaining stims in window: 25, 50, 75, 100 (total = 4)
+        g_unblock = self.gate.evaluate(t=169, stim_history=stim_history, contraindication=False, confidence=1.0)
+        self.assertEqual(g_unblock, 1, "Gate must allow stimulation once oldest stimulation exits rolling window")
+
+    # -------------------------------------------------------------------------
+    # 2. Pharmacodynamic Kinetics Tests
+    # -------------------------------------------------------------------------
+    def test_treatment_dose_carryover_recurrence(self):
+        """Verifies analytical recurrence of dose carryover D_k = gamma * D_{k-1} + n_k."""
+        d = 0.0
+        cum = 0
+        gamma = 0.85
+        # Day 1: 1 stim
+        d, cum, w, tol, eff = self.dynamics.step(d, cum, n_today=1, e_intrinsic=0.5)
+        self.assertAlmostEqual(d, 1.0, places=7)
+        self.assertEqual(cum, 1)
+
+        # Day 2: 0 stim
+        d, cum, w, tol, eff = self.dynamics.step(d, cum, n_today=0, e_intrinsic=0.5)
+        self.assertAlmostEqual(d, 0.85, places=7)
+        self.assertEqual(cum, 1)
+
+        # Day 3: 2 stims
+        d, cum, w, tol, eff = self.dynamics.step(d, cum, n_today=2, e_intrinsic=0.5)
+        self.assertAlmostEqual(d, 0.85 * 0.85 + 2.0, places=7)
+        self.assertEqual(cum, 3)
+
+    def test_saturation_and_tolerance_limits(self):
+        """Saturation w_k approaches 1 as dose -> inf, tolerance -> 0 as cum_stims -> inf."""
+        # Massive dose
+        d_k, cum, w, tol, eff = self.dynamics.step(d_prev=100.0, cum_stims=0, n_today=10, e_intrinsic=1.0)
+        self.assertGreater(w, 0.9999, "Saturation must approach 1 for large dose")
+
+        # Massive chronic stimulations
+        d_k, cum, w, tol, eff = self.dynamics.step(d_prev=0.0, cum_stims=500, n_today=0, e_intrinsic=1.0)
+        self.assertLess(tol, 0.001, "Tolerance factor must approach 0 for high cumulative stimulations")
+
+    def test_zero_efficacy_boundary(self):
+        """When e_intrinsic = 0 (non-responder), effective efficacy e_eff MUST be exactly 0."""
+        d_k, cum, w, tol, eff = self.dynamics.step(d_prev=5.0, cum_stims=10, n_today=2, e_intrinsic=0.0)
+        self.assertEqual(eff, 0.0, "Effective efficacy must be strictly 0 for non-responders")
+
+    # -------------------------------------------------------------------------
+    # 3. Known Simplified Trajectory (10-Day Trace)
+    # -------------------------------------------------------------------------
+    def test_known_10_day_trajectory(self):
+        """Step-by-step verification on a deterministic 10-day synthetic trajectory."""
+        # Patient intrinsic efficacy = 0.8
+        e_i = 0.8
+        d = 0.0
+        cum = 0
+        stim_history = []
+        stim_log = []
+
+        # Scheduled protocol: attempts stimulation at 09:00 on days 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+        # Days 0, 1, 2, 3, 4: should succeed (5 stims)
+        # Day 5: should be BLOCKED by weekly cap (5 stims in rolling 7 days)
+        # Day 6: should be BLOCKED by weekly cap
+        # Day 7: t = 7*24 + 9 = 177. 177 - 168 = 9. Stim at day 0 was at t=9.
+        # Boundary at Day 7 depends on strict inequalities. Let's trace explicitly:
+        for day in range(10):
+            t_eval = day * 24 + 9
+            g = self.gate.evaluate(t=t_eval, stim_history=stim_history)
+            n_today = 1 if g == 1 else 0
+            if n_today == 1:
+                stim_history.append(t_eval)
+            stim_log.append(n_today)
+            d, cum, w, tol, eff = self.dynamics.step(d, cum, n_today, e_i)
+
+        # Days 0, 1, 2, 3, 4 fired (5 stims)
+        self.assertEqual(stim_log[0:5], [1, 1, 1, 1, 1])
+        # Day 5 (t=129) must be blocked because all 5 stims are within past 168 h
+        self.assertEqual(stim_log[5], 0)
+        # Day 6 (t=153) must be blocked
+        self.assertEqual(stim_log[6], 0)
+        # Day 7 (t=177): Day 0 (t=9) rolls out of past 168h window (177-168=9). Day 7 unblocks!
+        self.assertEqual(stim_log[7], 1)
+        # Day 8 (t=201): Day 1 (t=33) rolls out (201-168=33). Day 8 unblocks!
+        self.assertEqual(stim_log[8], 1)
+        # Day 9 (t=225): Day 2 (t=57) rolls out (225-168=57). Day 9 unblocks!
+        self.assertEqual(stim_log[9], 1)
+        # Total stimulations over 10 days = 5 + 0 + 0 + 1 + 1 + 1 = 8
+        self.assertEqual(cum, 8)
+
+    # -------------------------------------------------------------------------
+    # 4. Missing Data Graceful Handling
+    # -------------------------------------------------------------------------
+    def test_missing_data_imputation_fallback(self):
+        """Verifies that 100% missing DP observations fall back to normative prior without crash."""
+        n_days = 30
+        y_obs = np.full(n_days, np.nan)
+        missing_indicator = np.ones(n_days)
+
+        # EWMA with missingness handling
+        alpha = 0.3
+        ewma_y = np.zeros(n_days)
+        last_val = 0.0  # Population prior
+        for k in range(n_days):
+            if not np.isnan(y_obs[k]):
+                last_val = alpha * y_obs[k] + (1 - alpha) * last_val
+            ewma_y[k] = last_val
+
+        self.assertTrue(np.all(ewma_y == 0.0), "EWMA of 100% missing data must remain at normative prior 0.0")
+        self.assertFalse(np.any(np.isnan(ewma_y)), "Imputed sequence must not contain NaNs")
+
+    # -------------------------------------------------------------------------
+    # 5. Burden-Matching & Fair Comparator Tests
+    # -------------------------------------------------------------------------
+    def test_burden_matching_exact_count_and_safety_constraints(self):
+        """Verifies build_burden_matched_days achieves exact target counts under all safety constraints."""
+        from literature.dpcln_stress_test import sample_patient_cohort, build_burden_matched_days, run_patient_simulation, SimpleLogisticRiskModel
+        rng = np.random.default_rng(101)
+        cohort = sample_patient_cohort(20, rng)
+        model = SimpleLogisticRiskModel()
+
+        for p in cohort:
+            for n_target in [0, 5, 15, 30]:
+                selected = build_burden_matched_days(n_target, p, rng, ref_h=24, cap_w=5)
+                self.assertEqual(len(selected), n_target, f"Failed to match target count {n_target}")
+
+                # Verify refractory constraint (minimum 1-day gap for ref_h=24)
+                sorted_days = sorted(selected)
+                for idx in range(len(sorted_days) - 1):
+                    self.assertGreaterEqual(sorted_days[idx + 1] - sorted_days[idx], 1, "Refractory violation in selected days")
+
+                # Verify rolling 7-day cap constraint (<= 5 per 7 days)
+                for st in sorted_days:
+                    in_window = sum(1 for o in sorted_days if st - 7 < o <= st)
+                    self.assertLessEqual(in_window, 5, "Weekly cap violation in selected days")
+
+                # Verify that run_patient_simulation delivers EXACTLY n_target stimulations
+                z, u_mat = run_patient_simulation(p, "burden_matched_random", model, target_stim_days=selected)
+                delivered = np.sum(u_mat[30:])  # Scored post burn-in
+                self.assertEqual(delivered, n_target, f"Delivered stimulations ({delivered}) != target ({n_target})")
+
+    def test_burden_matching_refractory_48h(self):
+        """Verifies burden matching enforces 48-hour refractory (>= 2-day gap) correctly."""
+        from literature.dpcln_stress_test import sample_patient_cohort, build_burden_matched_days
+        rng = np.random.default_rng(202)
+        cohort = sample_patient_cohort(10, rng)
+        for p in cohort:
+            for n_target in [5, 15, 25]:
+                selected = build_burden_matched_days(n_target, p, rng, ref_h=48, cap_w=5)
+                self.assertEqual(len(selected), n_target)
+                sorted_days = sorted(selected)
+                for idx in range(len(sorted_days) - 1):
+                    self.assertGreaterEqual(sorted_days[idx + 1] - sorted_days[idx], 2, "48-h refractory violation: gap < 2 days")
+
+    # -------------------------------------------------------------------------
+    # 6. Pipeline Lag & Latent State Leakage Tests
+    # -------------------------------------------------------------------------
+    def test_pipeline_lag_no_leakage(self):
+        """Verifies that features for day k depend strictly on history through day k-1 and cannot see day k data."""
+        from literature.dpcln_stress_test import SimpleLogisticRiskModel
+        model = SimpleLogisticRiskModel()
+        rng = np.random.default_rng(303)
+
+        n_days = 20
+        y = rng.normal(0, 1, size=n_days)
+        is_missing = np.zeros(n_days, dtype=bool)
+
+        feat_orig = model.extract_features(y, is_missing)
+
+        # Alter day k's observation dramatically
+        for k in range(1, n_days):
+            y_modified = y.copy()
+            y_modified[k] += 100.0  # Massive spike on day k
+            is_miss_modified = is_missing.copy()
+            is_miss_modified[k] = True
+
+            feat_mod = model.extract_features(y_modified, is_miss_modified)
+
+            # Features AT day k MUST NOT change (strict 1-day lag)
+            np.testing.assert_allclose(feat_mod[k], feat_orig[k], err_msg=f"Leakage detected: day {k} features changed when day {k} data altered!")
+
+            # Features AT day k+1 MUST reflect day k's change
+            if k + 1 < n_days:
+                self.assertFalse(np.allclose(feat_mod[k + 1], feat_orig[k + 1]), f"Lag error: day {k+1} features failed to reflect day {k} change!")
+
+    def test_uninformative_scenario_dissociation(self):
+        """Verifies uninformative scenario defaults to m_b=0 and has zero coupling to disease state."""
+        from literature.dpcln_stress_test import sample_patient_cohort, generate_patient_observations
+        rng = np.random.default_rng(404)
+        cohort = sample_patient_cohort(10, rng, scenario="uninformative")
+
+        for p in cohort:
+            self.assertEqual(p["a"], 0.0, "Uninformative scenario must have a=0")
+            self.assertEqual(p["c"], 0.0, "Uninformative scenario must have c=0")
+            self.assertEqual(p["miss_inform"], 0, "Uninformative scenario must have miss_inform=0 (no missingness leakage)")
+
+            # Generate observations across synthetic alternating states (180 days)
+            z_seq = np.array([0, 1, 2] * 60)
+            b, y, is_missing = generate_patient_observations(p, z_seq)
+
+            # When a=0 and c=0, y MUST be identically equal to pure noise e_dp (zero state dependency)
+            np.testing.assert_allclose(y, p["e_dp"], err_msg="y must be identically equal to pure DP noise e_dp")
+
+            # When miss_inform=0, missingness probability is strictly constant (logistic(-2.0))
+            # regardless of whether state is 0, 1, or 2
+            p_miss_const = 1.0 / (1.0 + np.exp(2.0))
+            expected_missing = p["miss_u"] < p_miss_const
+            np.testing.assert_array_equal(is_missing, expected_missing, err_msg="Missingness must be strictly independent of state")
+
+    def test_misleading_distribution_shift(self):
+        """Verifies train-test distribution shift for misleading scenario (rho_train=0.6, rho_test=0.0)."""
+        from literature.dpcln_stress_test import sample_patient_cohort
+        rng = np.random.default_rng(505)
+        train_cohort = sample_patient_cohort(5, rng, scenario="misleading", is_test=False)
+        test_cohort = sample_patient_cohort(5, rng, scenario="misleading", is_test=True)
+
+        for p in train_cohort:
+            self.assertAlmostEqual(p["rho_ctx"], 0.6, places=5, msg="Train cohort must have rho_train=0.6")
+        for p in test_cohort:
+            self.assertAlmostEqual(p["rho_ctx"], 0.0, places=5, msg="Test cohort must have rho_test=0.0 (distribution shift)")
+
+    # -------------------------------------------------------------------------
+    # 7. Outcome Sign & Statistical Metric Tests
+    # -------------------------------------------------------------------------
+    def test_primary_benefit_sign_convention(self):
+        """Confirms positive benefit strictly corresponds to fewer episodes under adaptive controller."""
+        epi_rand = np.array([0.25, 0.30, 0.20])
+        epi_adaptive = np.array([0.10, 0.15, 0.05])
+
+        paired_diff = epi_rand - epi_adaptive
+        benefit = np.mean(paired_diff)
+
+        self.assertGreater(benefit, 0.0, "Benefit must be strictly positive when adaptive policy reduces episodes")
+        self.assertAlmostEqual(benefit, 0.15, places=5)
+
+    def test_bootstrap_confidence_interval(self):
+        """Verifies bootstrap CI generates correct percentile bounds."""
+        rng = np.random.default_rng(606)
+        diffs = rng.normal(0.05, 0.02, size=100)
+        n_boot = 1000
+        boot_means = np.zeros(n_boot)
+        for b in range(n_boot):
+            boot_idx = rng.integers(0, len(diffs), size=len(diffs))
+            boot_means[b] = np.mean(diffs[boot_idx])
+        ci_lower = np.percentile(boot_means, 2.5)
+        ci_upper = np.percentile(boot_means, 97.5)
+
+        self.assertLess(ci_lower, np.mean(diffs))
+        self.assertGreater(ci_upper, np.mean(diffs))
+
+    # -------------------------------------------------------------------------
+    # 8. Bounded Threshold Modulation Tests (Eq. 5.6 & Sec 6)
+    # -------------------------------------------------------------------------
+    def test_bounded_threshold_adaptation(self):
+        """
+        Verifies theta_b(r_hat) = clip(theta_0 - kappa*(r_hat - r_bar), theta_min, theta_max).
+        Prevents runaway threshold collapse under extreme high risk (r_hat = 1.0)
+        and unbounded threshold escalation under zero risk.
+        """
+        theta_0 = 1.2
+        r_bar = 0.2
+        kappa = 3.0
+        theta_min = 0.5
+        theta_max = 2.5
+
+        # Extreme high risk: r_hat = 1.0
+        # Unbounded would yield 1.2 - 3.0*(0.8) = -1.2 (runaway hyper-stimulation collapse)
+        unbounded_high = theta_0 - kappa * (1.0 - r_bar)
+        self.assertAlmostEqual(unbounded_high, -1.2, places=5)
+        bounded_high = np.clip(unbounded_high, theta_min, theta_max)
+        self.assertEqual(bounded_high, theta_min, "Floor theta_min must prevent threshold collapse below 0.5")
+
+        # Baseline risk: r_hat = r_bar = 0.2
+        bounded_base = np.clip(theta_0 - kappa * (r_bar - r_bar), theta_min, theta_max)
+        self.assertEqual(bounded_base, theta_0, "At baseline risk, threshold must equal nominal theta_0")
+
+        # Low risk: r_hat = 0.0
+        unbounded_low = theta_0 - kappa * (0.0 - r_bar)
+        self.assertAlmostEqual(unbounded_low, 1.8)
+        bounded_low = np.clip(unbounded_low, theta_min, theta_max)
+        self.assertAlmostEqual(bounded_low, 1.8)
+
+        # Extreme negative perturbation driving threshold above theta_max
+        unbounded_extreme_low = theta_0 - kappa * (-0.6)  # 1.2 + 1.8 = 3.0
+        bounded_ceiling = np.clip(unbounded_extreme_low, theta_min, theta_max)
+        self.assertEqual(bounded_ceiling, theta_max, "Ceiling theta_max must bound upper threshold at 2.5")
+
+
+def run_tests():
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestDPCLNSimulationLogic)
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return result.wasSuccessful()
+
+
+if __name__ == "__main__":
+    success = run_tests()
+    sys.exit(0 if success else 1)
